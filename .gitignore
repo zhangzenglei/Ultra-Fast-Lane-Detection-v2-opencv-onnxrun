@@ -1,0 +1,6 @@
+/build*/
+/outputs/
+/weights/
+/model/weights/
+*.onnx
+*.onnx.baiduyun.p.downloading
