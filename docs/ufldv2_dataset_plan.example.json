@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "status": "planning_only_not_training_ready",
+  "backbone": "resnet18",
+  "pretrained_pytorch_checkpoint": "not_selected_yet",
+  "existing_deployment_onnx": "model/weights/ufldv2_culane_res18_320x1600.onnx",
+  "reviewed_tasks": [
+    {
+      "annotations": "outputs/annotations/reviewed/v6453_0001/annotations.xml",
+      "task_manifest": "outputs/annotations/v6453_prelabels/v6453_0001/manifest.json"
+    }
+  ],
+  "required_review_status": ["approved_positive", "approved_negative"],
+  "exclude_status": "excluded",
+  "resolution_policy": {
+    "mode": "undecided",
+    "allowed_future_modes": ["explicit_resize_to_culane", "native_resolution_loader_adapter"],
+    "source_width": 3840,
+    "source_height": 2160,
+    "culane_width": 1640,
+    "culane_height": 590,
+    "network_width": 1600,
+    "network_height": 320,
+    "crop_ratio": 0.6,
+    "preserve_original_annotations": true
+  },
+  "lane_policy": {
+    "max_lanes": 4,
+    "require_explicit_unique_ufld_slot": true,
+    "slot_to_mask_pixel_value": {"0": 1, "1": 2, "2": 3, "3": 4},
+    "excess_lanes": "exclude_until_explicit_policy_no_silent_truncation"
+  },
+  "split_policy": {
+    "group_key": "sequence_id",
+    "seed": 20260916,
+    "train_sequence_ids": [],
+    "val_sequence_ids": [],
+    "test_sequence_ids": [],
+    "groups_must_be_disjoint": true,
+    "random_adjacent_frame_split_allowed": false
+  },
+  "output_root": "outputs/datasets/culane_reviewed_v1",
+  "conversion_implemented": false,
+  "training_authorized": false
+}

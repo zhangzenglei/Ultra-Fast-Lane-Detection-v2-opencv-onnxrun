@@ -63,24 +63,73 @@ static double elapsed_ms(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
+struct InferenceConfig {
+    string input_color = "bgr";
+    string enhance = "none";
+    double row_min_ratio = 0.5;
+    double col_min_ratio = 0.25;
+};
+
+static Json inference_settings(const InferenceConfig& config) {
+    return {{"input_color", config.input_color}, {"enhance", config.enhance},
+            {"row_min_ratio", config.row_min_ratio}, {"col_min_ratio", config.col_min_ratio},
+            {"crop_ratio", 0.6}};
+}
+
+static bool passes_lane_gate(int64_t valid, int64_t total, double ratio) {
+    return valid > total * ratio;
+}
+
+static Mat enhance_pixels(const Mat& bgr, const InferenceConfig& config) {
+    if (config.enhance == "none") return bgr;
+    Mat ycrcb, result;
+    cvtColor(bgr, ycrcb, COLOR_BGR2YCrCb);
+    vector<Mat> channels;
+    split(ycrcb, channels);
+    createCLAHE(2.0, Size(8, 8))->apply(channels[0], channels[0]);
+    merge(channels, ycrcb);
+    cvtColor(ycrcb, result, COLOR_YCrCb2BGR);
+    return result;
+}
+
+static vector<float> normalize_pixels(const Mat& img, int height, int width,
+                                      const InferenceConfig& config) {
+    if (img.type() != CV_8UC3 || img.cols != width || img.rows < height)
+        throw runtime_error("Expected resized CV_8UC3 image with enough rows for bottom crop");
+    const float mean[3] = {0.485f, 0.456f, 0.406f};
+    const float stddev[3] = {0.229f, 0.224f, 0.225f};
+    vector<float> tensor(size_t(height) * width * 3);
+    size_t index = 0;
+    for (int c = 0; c < 3; ++c) {
+        const int source_channel = config.input_color == "rgb" ? 2 - c : c;
+        for (int y = img.rows - height; y < img.rows; ++y)
+            for (int x = 0; x < width; ++x) {
+                float pixel = img.ptr<uchar>(y)[x * 3 + source_channel];
+                tensor[index++] = (pixel / 255.0 - mean[c]) / stddev[c];
+            }
+    }
+    return tensor;
+}
+
 class Ultra_Fast_Lane_Detection_v2
 {
 public:
-	Ultra_Fast_Lane_Detection_v2(const string& model_path, const string& device, int gpu_id, const fs::path& profile_dir);
+	Ultra_Fast_Lane_Detection_v2(const string& model_path, const string& device, int gpu_id, const fs::path& profile_dir,
+                                const InferenceConfig& config = {});
 	Mat detect(Mat& cv_image);
 	void verify_profile(bool require_cuda);
     void benchmark(int warmup, int iterations);
     vector<vector<Point>> lanes;
+    Json diagnostics = Json::array();
     double preprocess_ms = 0, inference_ms = 0, postprocess_ms = 0;
 
 private:
+    InferenceConfig config_;
 	void normalize_(Mat img);
 	float SoftMaxFast(const float* src, float* dst, int64_t length);
 	int inpWidth;
 	int inpHeight;
 	vector<float> input_image_;
-	float mean[3] = { 0.485, 0.456, 0.406 };
-	float std[3] = { 0.229, 0.224, 0.225 };
 	string dataset;
 	int num_row;
 	int num_col;
@@ -101,7 +150,8 @@ private:
 };
 
 Ultra_Fast_Lane_Detection_v2::Ultra_Fast_Lane_Detection_v2(
-    const string& model_path, const string& device, int gpu_id, const fs::path& profile_dir)
+    const string& model_path, const string& device, int gpu_id, const fs::path& profile_dir,
+    const InferenceConfig& config) : config_(config)
 {
     sessionOptions.SetGraphOptimizationLevel(ORT_ENABLE_BASIC);
     // Keep CPU resource usage bounded and reproducible on laptop systems.
@@ -165,6 +215,7 @@ Ultra_Fast_Lane_Detection_v2::Ultra_Fast_Lane_Detection_v2(
     cout << "ORT " << OrtGetApiBase()->GetVersionString()
          << " device_requested=" << device << " gpu_id=" << gpu_id
          << " input_shape=[1,3,320,1600] CPU_threads=4\n";
+    cout << "Inference settings: " << inference_settings(config_).dump() << '\n';
 }
 
 vector<Value> Ultra_Fast_Lane_Detection_v2::run() {
@@ -253,22 +304,7 @@ void Ultra_Fast_Lane_Detection_v2::GenerateAnchor()
 
 void Ultra_Fast_Lane_Detection_v2::normalize_(Mat img)
 {
-	//img.convertTo(img, CV_32F);
-	int row = img.rows;
-	int col = img.cols;
-	this->input_image_.resize(inpHeight * inpWidth * img.channels());
-	int ind = 0;
-	for (int c = 0; c < 3; c++)
-	{
-		for (int i = row - inpHeight; i < row; i++)
-		{
-			for (int j = 0; j < col; j++)
-			{
-				float pix = img.ptr<uchar>(i)[j * 3 + c];
-				this->input_image_[ind++] = (pix / 255.0 - mean[c]) / std[c];
-			}
-		}
-	}
+    input_image_ = normalize_pixels(img, inpHeight, inpWidth, config_);
 }
 
 float Ultra_Fast_Lane_Detection_v2::SoftMaxFast(const float* src, float* dst, int64_t length)
@@ -296,6 +332,7 @@ Mat Ultra_Fast_Lane_Detection_v2::detect(Mat& srcimg)
 	const int img_w = srcimg.cols;
 	Mat dstimg;
 	resize(srcimg, dstimg, Size(this->inpWidth, int(float(this->inpHeight) / this->crop_ratio)), 0, 0, INTER_LINEAR);
+    dstimg = enhance_pixels(dstimg, config_);
 	this->normalize_(dstimg);
     preprocess_ms = elapsed_ms(start);
     start = Clock::now();
@@ -326,10 +363,17 @@ Mat Ultra_Fast_Lane_Detection_v2::detect(Mat& srcimg)
 	vector<int64_t> max_indices_col = argmax_1(loc_col, loc_col_dims);
 	vector<int64_t> valid_col = argmax_1(exist_col, exist_col_dims);
 
+    diagnostics = Json::array();
+    for (int slot = 0; slot < 4; ++slot) diagnostics.push_back(Json::object());
 	vector<vector<Point>> line_list(4);
 	for (int64_t i : { 1, 2 })
 	{
-		if (sum_valid(valid_row, num_cls_row, num_lane_row, i) > num_cls_row * 0.5)
+        const auto count = sum_valid(valid_row, num_cls_row, num_lane_row, i);
+        const bool passed = passes_lane_gate(count, num_cls_row, config_.row_min_ratio);
+        diagnostics[i] = {{"slot", i}, {"branch", "row"}, {"valid_anchors", count},
+            {"total_anchors", num_cls_row}, {"minimum_valid_anchors", int(floor(num_cls_row * config_.row_min_ratio)) + 1},
+            {"passed_gate", passed}};
+		if (passed)
 		{
 			for (int64_t k = 0; k < num_cls_row; k++)
 			{
@@ -362,7 +406,12 @@ Mat Ultra_Fast_Lane_Detection_v2::detect(Mat& srcimg)
 
 	for (int64_t i : {0, 3})
 	{
-		if (sum_valid(valid_col, num_cls_col, num_lane_col, i) > num_cls_col / 4)
+        const auto count = sum_valid(valid_col, num_cls_col, num_lane_col, i);
+        const bool passed = passes_lane_gate(count, num_cls_col, config_.col_min_ratio);
+        diagnostics[i] = {{"slot", i}, {"branch", "col"}, {"valid_anchors", count},
+            {"total_anchors", num_cls_col}, {"minimum_valid_anchors", int(floor(num_cls_col * config_.col_min_ratio)) + 1},
+            {"passed_gate", passed}};
+		if (passed)
 		{
 			for (int64_t k = 0; k < num_cls_col; k++)
 			{
@@ -403,13 +452,17 @@ Mat Ultra_Fast_Lane_Detection_v2::detect(Mat& srcimg)
 	}
 
     lanes.clear();
-    for (const auto& line : line_list) if (!line.empty()) lanes.push_back(line);
+    for (size_t slot = 0; slot < line_list.size(); ++slot) {
+        diagnostics[slot]["exported_points"] = line_list[slot].size();
+        if (!line_list[slot].empty()) lanes.push_back(line_list[slot]);
+    }
     postprocess_ms = elapsed_ms(start);
 	return drawimg;
 }
 
 
 struct Options {
+    InferenceConfig inference;
     string model = "weights/ufldv2_culane_res18_320x1600.onnx";
     string image, image_dir, output, output_dir = "outputs", device = "cuda";
     int gpu_id = 0, warmup = 10, iterations = 100;
@@ -425,6 +478,10 @@ static void help() {
          << "  --gpu-id N             Default 0\n"
          << "  --save-points          Save original-image pixel coordinates as JSON\n"
          << "  --skip-existing        Resume completed outputs (requires --save-points)\n"
+         << "  --input-color bgr|rgb  Tensor channel order (default bgr, original behavior)\n"
+         << "  --enhance none|clahe   Optional luminance CLAHE (default none)\n"
+         << "  --row-min-ratio R      Require valid row anchors > R*72 (default 0.5)\n"
+         << "  --col-min-ratio R      Require valid col anchors > R*81 (default 0.25)\n"
          << "  --benchmark            Benchmark synchronous Run after profile verification\n"
          << "  --warmup N             Default 10 (non-negative)\n"
          << "  --iterations N         Default 100 (positive)\n"
@@ -441,6 +498,16 @@ static int integer(const string& value, const string& option) {
     return parsed;
 }
 
+static double ratio_value(const string& value, const string& option) {
+    size_t end = 0;
+    double parsed;
+    try { parsed = stod(value, &end); }
+    catch (const exception&) { throw runtime_error("Invalid ratio for " + option + ": " + value); }
+    if (end != value.size() || !std::isfinite(parsed) || parsed < 0 || parsed > 1)
+        throw runtime_error("Ratio must be finite and in [0,1] for " + option);
+    return parsed;
+}
+
 static Options parse(int argc, char** argv) {
     Options o;
     set<string> seen;
@@ -451,7 +518,8 @@ static Options parse(int argc, char** argv) {
         if (key == "--skip-existing") { o.skip_existing = true; continue; }
         if (key == "--benchmark") { o.benchmark = true; continue; }
         const set<string> valued{"--model", "--image", "--image-dir", "--output", "--output-dir",
-                                "--device", "--gpu-id", "--warmup", "--iterations"};
+                                "--device", "--gpu-id", "--warmup", "--iterations",
+                                "--input-color", "--enhance", "--row-min-ratio", "--col-min-ratio"};
         if (!valued.count(key)) throw runtime_error("Unknown option: " + key);
         if (++i == argc || string(argv[i]).rfind("--", 0) == 0 || string(argv[i]).empty())
             throw runtime_error("Missing value for " + key);
@@ -465,17 +533,26 @@ static Options parse(int argc, char** argv) {
         else if (key == "--gpu-id") o.gpu_id = integer(value, key);
         else if (key == "--warmup") o.warmup = integer(value, key);
         else if (key == "--iterations") o.iterations = integer(value, key);
+        else if (key == "--input-color") o.inference.input_color = value;
+        else if (key == "--enhance") o.inference.enhance = value;
+        else if (key == "--row-min-ratio") o.inference.row_min_ratio = ratio_value(value, key);
+        else if (key == "--col-min-ratio") o.inference.col_min_ratio = ratio_value(value, key);
     }
     if (o.image.empty() == o.image_dir.empty()) throw runtime_error("Specify exactly one of --image and --image-dir");
     if (!o.image_dir.empty() && !o.output.empty()) throw runtime_error("--output is single-image only; use --output-dir");
     if (o.device != "cuda" && o.device != "cpu") throw runtime_error("--device must be cuda or cpu");
+    if (o.inference.input_color != "bgr" && o.inference.input_color != "rgb")
+        throw runtime_error("--input-color must be bgr or rgb");
+    if (o.inference.enhance != "none" && o.inference.enhance != "clahe")
+        throw runtime_error("--enhance must be none or clahe");
     if (o.iterations == 0) throw runtime_error("--iterations must be positive");
     if (o.skip_existing && !o.save_points) throw runtime_error("--skip-existing requires --save-points to validate existing results");
     return o;
 }
 
 static void save_json(const fs::path& destination, const fs::path& source,
-                      const Mat& image, const Options& o, const vector<vector<Point>>& lanes) {
+                      const Mat& image, const Options& o, const vector<vector<Point>>& lanes,
+                      const Json& diagnostics = Json::array()) {
     Json points = Json::array();
     for (const auto& lane : lanes) {
         Json sequence = Json::array();
@@ -484,7 +561,8 @@ static void save_json(const fs::path& destination, const fs::path& source,
     }
     Json data{{"source_image", source.string()}, {"image_width", image.cols},
               {"image_height", image.rows}, {"model_path", o.model},
-              {"device_requested", o.device}, {"lanes", points}};
+              {"device_requested", o.device}, {"lanes", points},
+              {"inference_settings", inference_settings(o.inference)}, {"lane_diagnostics", diagnostics}};
     ofstream file(destination);
     file << data.dump(2) << '\n';
     file.close();
@@ -540,6 +618,9 @@ int main(int argc, char** argv) {
                     metadata.at("device_requested").get<string>() != o.device ||
                     !metadata.at("lanes").is_array() || fs::file_size(destination) == 0)
                     throw runtime_error("Existing output metadata does not match requested input/model/device: " + destination.string());
+                const Json saved_settings = metadata.value("inference_settings", inference_settings(InferenceConfig{}));
+                if (saved_settings != inference_settings(o.inference))
+                    throw runtime_error("Existing output has different preprocessing/postprocessing settings: " + destination.string());
                 ++skipped;
                 continue;
             }
@@ -561,7 +642,7 @@ int main(int argc, char** argv) {
             cout << "Summary: success=0 failed=0 skipped=" << skipped << '\n';
             return 0;
         }
-        Ultra_Fast_Lane_Detection_v2 net(o.model, o.device, o.gpu_id, fs::path(o.output_dir) / "profiles");
+        Ultra_Fast_Lane_Detection_v2 net(o.model, o.device, o.gpu_id, fs::path(o.output_dir) / "profiles", o.inference);
         size_t succeeded = 0, failed = 0;
         bool verified = false;
         for (size_t i = 0; i < images.size(); ++i) {
@@ -586,7 +667,7 @@ int main(int argc, char** argv) {
                 if (!imwrite(destination.string(), result)) throw runtime_error("imwrite failed: " + destination.string());
                 if (o.save_points) {
                     auto json_path = destination; json_path.replace_extension(".json");
-                    save_json(json_path, images[i], image, o, net.lanes);
+                    save_json(json_path, images[i], image, o, net.lanes, net.diagnostics);
                 }
                 cout << "image=" << images[i] << " size=" << image.cols << 'x' << image.rows
                      << " lanes=" << net.lanes.size() << " output=" << destination
